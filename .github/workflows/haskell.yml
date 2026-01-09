@@ -37,30 +37,4 @@ jobs:
     - name: Build
       run: cabal build
 
-    - name: Download ghr (Windows)
-      run: |
-        curl -sSLO https://github.com/tcnksm/ghr/releases/download/v0.14.0/ghr_v0.14.0_windows_amd64.zip
-        powershell -Command "Expand-Archive -Path ghr_v0.14.0_windows_amd64.zip -DestinationPath . -Force"
-        Move-Item -Path ghr_v0.14.0_windows_amd64/ghr.exe -Destination ./
 
-    - name: Calculate and save checksum
-      run: |
-        $exePath = Get-ChildItem -Path dist-newstyle -Recurse -Filter "postgres-websockets.exe" | Select-Object -First 1 -ExpandProperty FullName
-        Get-FileHash -Path $exePath -Algorithm SHA256 | Format-List | Out-File -FilePath "dist-newstyle/postgres-websockets.sha256"
-
-    - name: Publish Release on GitHub
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        New-Item -ItemType Directory -Path ./release -Force
-        $exePath = Get-ChildItem -Path dist-newstyle -Recurse -Filter "postgres-websockets.exe" | Select-Object -First 1 -ExpandProperty FullName
-        Copy-Item -Path $exePath -Destination ./release/
-        Copy-Item -Path "dist-newstyle/postgres-websockets.sha256" -Destination ./release/
-
-        $cabalContent = Get-Content -Path "postgres-websockets.cabal"
-        $versionLine = $cabalContent | Where-Object { $_ -match '^version:' }
-        $version = ($versionLine -split ' ')[1].Trim()
-        
-        Write-Output "Detected version: $version"
-        
-        .\ghr.exe -t $env:GITHUB_TOKEN -u ${{ github.repository_owner }} -r ${{ github.event.repository.name }} $version ./release
