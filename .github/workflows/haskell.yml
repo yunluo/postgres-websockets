@@ -34,6 +34,6 @@ jobs:
         key: ${{ matrix.os }}-${{ matrix.ghc }}-v3-${{ hashFiles('**/*.cabal') }}
 
     - name: Build
-      run: cabal build
+      run: cabal build --ghc-option="-D_WIN32"
 
 
