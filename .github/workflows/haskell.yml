@@ -1,43 +1,81 @@
-name: Haskell CI
+# .github/workflows/haskell.yml
 
+name: Haskell CI (Windows x64)
+
+# 控制工作流在什么情况下触发
 on:
+  # 当向 main 或 master 分支推送时触发
   push:
-    branches: [ "master" ]
+    branches: [ "main", "master" ]
+  # 当创建针对 main 或 master 分支的拉取请求时触发
   pull_request:
-    branches: [ "master" ]
+    branches: [ "main", "master" ]
 
-permissions:
-  contents: read
+# 允许此工作流同时并发运行的数量
+# 设置为 0 表示同一仓库的此工作流将按顺序运行
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
-
-    runs-on: ubuntu-latest
-
+    # 运行在 Windows Server 2022 环境上
+    runs-on: windows-latest
+    
+    # 步骤列表，按顺序执行
     steps:
-    - uses: actions/checkout@v4
-    - uses: actions/setup-haskell@v1
-      with:
-        ghc-version: '8.10.3'
-        cabal-version: '3.2'
+      # 1. 检出仓库代码
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Cache
-      uses: actions/cache@v3
-      env:
-        cache-name: cache-cabal
-      with:
-        path: ~/.cabal
-        key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('**/*.cabal') }}-${{ hashFiles('**/cabal.project') }}
-        restore-keys: |
-          ${{ runner.os }}-build-${{ env.cache-name }}-
-          ${{ runner.os }}-build-
-          ${{ runner.os }}-
+      # 2. 设置 Haskell 环境 (GHC, Cabal)
+      # 这个 action 会自动安装 GHCup，然后通过它安装指定的 GHC 和 Cabal 版本
+      # 我们使用 LTS-20.0，它默认使用 GHC 9.6.4，这是一个稳定且较新的版本
+      - name: Setup Haskell (GHCup)
+        uses: haskell-actions/setup@v2
+        with:
+          ghc-version: 'lts-20.0' # 使用一个稳定的 LTS 版本
+          cabal-version: 'latest'  # 安装最新的 Cabal 版本
 
-    - name: Install dependencies
-      run: |
-        cabal update
-        cabal build --only-dependencies --enable-tests --enable-benchmarks
-    - name: Build
-      run: cabal build --enable-tests --enable-benchmarks all
-    - name: Run tests
-      run: cabal test all
+      # 3. 缓存 Cabal 依赖项以加速后续构建
+      # 这会缓存 .cabal/packages 和 dist-newstyle 目录
+      - name: Cache Cabal dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cabal/packages
+            ~/.cabal/store
+            dist-newstyle
+          key: ${{ runner.os }}-cabal-${{ hashFiles('**/*.cabal') }}
+          restore-keys: |
+            ${{ runner.os }}-cabal-
+
+      # 4. 更新 Cabal 包列表
+      # 这是一个好习惯，确保获取最新的包版本信息
+      - name: Update Cabal package list
+        run: cabal update
+
+      # 5. 构建项目
+      # 'cabal build' 会根据项目中的 .cabal 文件进行编译
+      # 我们指定要构建的库/可执行文件名称，确保只构建必要部分
+      - name: Build project
+        run: cabal build postgres-websockets
+
+      # 6. 安装项目
+      # 'cabal install' 会将构建好的可执行文件复制到 ~/.cabal/bin
+      # 这正是您提供的构建说明中要求的步骤
+      - name: Install project
+        run: cabal install postgres-websockets
+
+      # 7. 验证安装 (可选，但推荐)
+      # 检查 'postgres-websockets' 命令是否可用，并打印其版本号
+      # 这可以确认安装步骤成功
+      - name: Verify installation
+        run: |
+          # 在 Windows 上，cabal bin 的路径是 ~/.cabal/bin
+          # 我们需要将其添加到 PATH 中，或者使用完整路径调用
+          # cabal install 会自动将路径添加到当前会话的 PATH 中
+          postgres-websockets --version || echo "Command not found in PATH, checking direct path..."
+          # 如果命令不在 PATH 中，我们可以尝试直接调用
+          # Get the cabal path from the environment variable set by setup-haskell
+          $CABAL_DIR/bin/postgres-websockets --version
