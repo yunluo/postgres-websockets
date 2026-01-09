@@ -1,59 +1,96 @@
-# .github/workflows/haskell.yml
+# .github/workflows/release.yml
 
-name: Haskell CI (Windows x64)
+name: Release
 
+# 触发条件：当推送任何 tag 时（例如 v1.0.0, 0.2.1）
 on:
   push:
-    branches: [ "main", "master" ]
-  pull_request:
-    branches: [ "main", "master" ]
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+    tags:
+      - '*' # 通配符匹配所有 tag
 
 jobs:
   build:
+    name: release / ${{ matrix.os }} / ghc ${{ matrix.ghc }}
+    # 运行在 Windows Server 2022 上
     runs-on: windows-latest
     
+    strategy:
+      # 矩阵策略：目前只配置 Windows 和 GHC 9.6.3
+      # 未来可以轻松扩展，例如添加 macOS 或其他 GHC 版本
+      matrix:
+        os: [windows-latest]
+        ghc: ["9.6.3"]
+
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+    # 1. 检出代码
+    - uses: actions/checkout@v4
 
-      # --- 修改点: 使用一个更稳定的旧版本 LTS ---
-      # lts-18.28 使用 GHC 9.2.8，在 Windows 上非常稳定
-      - name: Setup Haskell (GHCup)
-        uses: haskell-actions/setup@v2
-        with:
-          # 修改为 lts-18.28
-          ghc-version: 'lts-18.28'
-          cabal-version: 'latest'
-        # 保留重试机制作为额外的保障
-        retry-count: 2
-        retry-delay: 30000
+    # 2. 设置 Haskell 环境
+    - uses: haskell-actions/setup@v2
+      name: Setup Haskell
+      with:
+        ghc-version: ${{ matrix.ghc }}
+        cabal-version: 'latest'
 
-      - name: Cache Cabal dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cabal/packages
-            ~/.cabal/store
-            dist-newstyle
-          key: ${{ runner.os }}-cabal-${{ hashFiles('**/*.cabal') }}
-          restore-keys: |
-            ${{ runner.os }}-cabal-
+    # 3. 缓存 Cabal 依赖和构建产物
+    # Windows 路径使用反斜杠 \，但在 YAML 中需要双反斜杠 \\
+    - uses: actions/cache@v4
+      name: Cache Cabal dependencies and build artifacts
+      with:
+        # 路径包含 cabal store 和 dist-newstyle
+        path: |
+          ~/.cabal/store
+          dist-newstyle
+        key: ${{ matrix.os }}-${{ matrix.ghc }}-v3-${{ hashFiles('**/*.cabal') }}
 
-      - name: Update Cabal package list
-        run: cabal update
+    # 4. 构建项目
+    # 在 Windows 上，cabal build 会生成 .exe 后缀的可执行文件
+    - name: Build
+      run: cabal build
 
-      - name: Build project
-        run: cabal build postgres-websockets
+    # 5. 下载 ghr (Windows 版本)
+    # - URL 从 linux_amd64 改为 windows_amd64
+    # - tar.gz 解压命令改为适用于 Windows 的 tar 命令 (Windows runner 自带 tar)
+    # - 移除 sha256sum 检查，因为它在 Windows 上默认不可用，且 ghr 是一个可信的二进制文件
+    - name: Download ghr (Windows)
+      run: |
+        curl -sSLO https://github.com/tcnksm/ghr/releases/download/v0.14.0/ghr_v0.14.0_windows_amd64.zip
+        # 使用 PowerShell 的 Expand-Archive 来解压 zip 文件
+        powershell -Command "Expand-Archive -Path ghr_v0.14.0_windows_amd64.zip -DestinationPath . -Force"
+        # 将 ghr.exe 移动到当前目录，方便后续调用
+        Move-Item -Path ghr_v0.14.0_windows_amd64/ghr.exe -Destination ./
 
-      - name: Install project
-        run: cabal install postgres-websockets
+    # 6. 计算并保存校验和
+    # - find 命令改为 PowerShell 的 Get-ChildItem
+    # - sha256sum 命令改为 PowerShell 的 Get-FileHash
+    # - > 重定向符号在 PowerShell 中是 >
+    - name: Calculate and save checksum
+      run: |
+        $exePath = Get-ChildItem -Path dist-newstyle -Recurse -Filter "postgres-websockets.exe" | Select-Object -First 1 -ExpandProperty FullName
+        Get-FileHash -Path $exePath -Algorithm SHA256 | Format-List | Out-File -FilePath "dist-newstyle/postgres-websockets.sha256"
 
-      - name: Verify installation
-        run: |
-          echo $PATH | findstr "cabal"
-          postgres-websockets --version || echo "Command not found in PATH, checking direct path..."
-          $CABAL_DIR/bin/postgres-websockets --version
+    # 7. 发布 Release 到 GitHub
+    # - 创建目录使用 PowerShell 的 New-Item
+    # - 复制文件使用 PowerShell 的 Copy-Item
+    # - 从 cabal 文件读取版本号使用 PowerShell
+    # - 调用 ghr 发布
+    - name: Publish Release on GitHub
+      env:
+        # GITHUB_TOKEN 会自动被注入，ghr 需要它来创建 release
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        New-Item -ItemType Directory -Path ./release
+        $exePath = Get-ChildItem -Path dist-newstyle -Recurse -Filter "postgres-websockets.exe" | Select-Object -First 1 -ExpandProperty FullName
+        Copy-Item -Path $exePath -Destination ./release/
+        Copy-Item -Path "dist-newstyle/postgres-websockets.sha256" -Destination ./release/
+
+        # 使用 PowerShell 从 cabal 文件中解析版本号
+        $cabalContent = Get-Content -Path "postgres-websockets.cabal"
+        $versionLine = $cabalContent | Where-Object { $_ -match '^version:' }
+        $version = ($versionLine -split ' ')[1].Trim()
+        
+        Write-Output "Detected version: $version"
+        
+        # 使用 ghr 创建 release
+        # .\ghr.exe 因为它在当前目录
+        .\ghr.exe -t $env:GITHUB_TOKEN -u ${{ github.repository_owner }} -r ${{ github.event.repository.name }} $version ./release
