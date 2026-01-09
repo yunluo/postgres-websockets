@@ -11,55 +11,113 @@ jobs:
     name: release / ${{ matrix.os }} / ghc ${{ matrix.ghc }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest]
-        ghc: ["9.6.3"]
+        include:
+          # Linux 构建
+          - os: ubuntu-latest
+            ghc: "9.6.3"
+            setup_action: haskell-actions/setup@v2
+            postgres_image: postgres
+            ghr_url: https://github.com/tcnksm/ghr/releases/download/v0.14.0/ghr_v0.14.0_linux_amd64.tar.gz
+            ghr_sha: v0.14.0_SHASUMS
+            ghr_binary: ghr
+            find_command: find
+            postgres_port: 5432
+            postgres_service: |
+              services:
+                postgres:
+                  image: postgres
+                  env:
+                    POSTGRES_PASSWORD: roottoor
+                    POSTGRES_USER: postgres
+                    POSTGRES_DB: postgres_ws_test
+                  options: >-
+                    --health-cmd pg_isready
+                    --health-interval 10s
+                    --health-timeout 5s
+                    --health-retries 5
+                  ports:
+                    - 5432:5432
+          
+          # Windows 构建
+          - os: windows-latest
+            ghc: "9.6.3"
+            setup_action: haskell-actions/setup@v2
+            postgres_image: postgres
+            ghr_url: https://github.com/tcnksm/ghr/releases/download/v0.14.0/ghr_v0.14.0_windows_amd64.zip
+            ghr_sha: v0.14.0_SHASUMS
+            ghr_binary: ghr.exe
+            find_command: Get-ChildItem -Recurse -Filter
+            postgres_port: 5432
+            postgres_service: |
+              # Windows 上不需要 services 块，直接安装 PostgreSQL
+              - name: Install PostgreSQL
+                run: |
+                  # 使用 Chocolatey 安装 PostgreSQL
+                  choco install postgresql --params '/Password:roottoor' -y
+                  # 确保服务启动
+                  net start postgresql-x64-14
+    ${{ matrix.postgres_service }}
 
-    services:
-      postgres:
-        image: postgres
-        env:
-          POSTGRES_PASSWORD: roottoor
-          POSTGRES_USER: postgres
-          POSTGRES_DB: postgres_ws_test
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 5432:5432
     steps:
     - uses: actions/checkout@v4
 
-    - uses: haskell-actions/setup@v2
-      name: Setup Haskell
+    - name: Setup Haskell (${{ matrix.os }})
+      uses: ${{ matrix.setup_action }}
       with:
         ghc-version: ${{ matrix.ghc }}
+        # Windows 上优先使用 GHCup，如果 setup action 不支持则手动安装
+        cabal-version: '3.10'
 
-    - uses: actions/cache@v4
-      name: Cache ~/dist-newstyle
+    - name: Cache ~/dist-newstyle
+      uses: actions/cache@v4
       with:
         path: ~/dist-newstyle
-        key: ${{ matrix.os }}-${{ matrix.ghc }}-v3
+        key: ${{ runner.os }}-${{ matrix.ghc }}-v3
+
+    - name: Install PostgreSQL dependencies (Windows only)
+      if: runner.os == 'Windows'
+      run: |
+        # 安装 OpenSSL 和其他必要的库
+        choco install openssl -y
+        refreshenv
 
     - name: Build
       run: |
-        cabal build
+        cabal update
+        cabal build --enable-executable-static
 
     - name: Download ghr
+      shell: bash
       run: |
-        curl -sSLO https://github.com/tcnksm/ghr/releases/download/v0.14.0/ghr_v0.14.0_linux_amd64.tar.gz
-        curl -sSLO https://github.com/tcnksm/ghr/releases/download/v0.14.0/v0.14.0_SHASUMS
-        sha256sum --check --ignore-missing v0.14.0_SHASUMS
-        tar --strip-components=1 -zxvf ghr_v0.14.0_linux_amd64.tar.gz ghr_v0.14.0_linux_amd64/ghr
+        if [ "${{ runner.os }}" = "Windows" ]; then
+          curl -sSLO ${{ matrix.ghr_url }}
+          unzip ghr_v0.14.0_windows_amd64.zip
+          mv ghr.exe ./ghr
+        else
+          curl -sSLO ${{ matrix.ghr_url }}
+          curl -sSLO https://github.com/tcnksm/ghr/releases/download/v0.14.0/${{ matrix.ghr_sha }}
+          sha256sum --check --ignore-missing ${{ matrix.ghr_sha }}
+          tar --strip-components=1 -zxvf ghr_v0.14.0_linux_amd64.tar.gz ghr_v0.14.0_linux_amd64/ghr
+          mv ghr ./ghr
+        fi
 
     - name: Calculate and save checksum
-      run:  sha256sum `find dist-newstyle -executable -type f -name postgres-websockets` > dist-newstyle/postgres-websockets.sha256
+      shell: bash
+      run: |
+        if [ "${{ runner.os }}" = "Windows" ]; then
+          Get-ChildItem -Recurse -Filter postgres-websockets.exe | ForEach-Object { certutil -hashfile $_.FullName SHA256 | Select-String -Pattern "^[0-9A-Fa-f]{64}$" } > dist-newstyle/postgres-websockets.sha256
+        else
+          sha256sum $(find dist-newstyle -executable -type f -name postgres-websockets) > dist-newstyle/postgres-websockets.sha256
+        fi
 
     - name: Publish Release on GitHub
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      shell: bash
       run: |
-        mkdir ./release
-        cp dist-newstyle/postgres-websockets.sha256 `find dist-newstyle -executable -type f -name postgres-websockets` ./release/
+        mkdir -p ./release
+        cp dist-newstyle/postgres-websockets.sha256 $(if [ "${{ runner.os }}" = "Windows" ]; then Get-ChildItem -Recurse -Filter postgres-websockets.exe; else find dist-newstyle -executable -type f -name postgres-websockets; fi) ./release/
         VERSION=$(awk '/^version: / { print $2 };' < postgres-websockets.cabal)
-        ./ghr -t ${{ secrets.GITHUB_TOKEN }} ${VERSION} ./release
+        ./ghr -t ${GITHUB_TOKEN} -delete ${VERSION} ./release
